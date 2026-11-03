@@ -34,7 +34,7 @@ npx hardhat compile
 | `NODE_ADDRESS` | Writer node que aprueba las tx (gas model) |
 | `DEPLOYER_ADDRESS` | Cuenta firmante; debe coincidir con la clave del bao |
 | `BAO_ADDR` | URL de OpenBao (default `http://127.0.0.1:8200`) |
-| `BAO_TOKEN` | Token de OpenBao. En local (docker, modo dev) es `root`; en producción, uno de vida corta con permiso de firma — ver [Token de OpenBao en producción](#token-de-openbao-en-producción) |
+| `BAO_TOKEN` | Token de OpenBao. En local (docker, modo dev) es `root`; en producción, uno de vida corta con permiso de firma — ver [Desplegar en producción](#desplegar-en-producción-paso-a-paso) |
 | `BAO_MOUNT` | Path del plugin ethsign (default `ethereum`) |
 
 ## Tasks
@@ -129,31 +129,133 @@ importa en el bao de docker. La tx de prueba se firma con un nonce inalcanzable
 Si el bao no está accesible, o falta `DEPLOYER_ADDRESS` / `BAO_TOKEN` contra un bao
 remoto, el test se salta (no falla) con un aviso.
 
-## Token de OpenBao en producción
+## Desplegar en producción (paso a paso)
 
-En producción **no existe un token root**, y no hay que guardar ningún token en el
-`.env`. Se usa uno de vida corta (1h, renovable hasta 4h) del rol `ethsign-signer`,
-que sólo permite leer cuentas y firmar transacciones (`/sign`): no exporta claves ni
-firma digests arbitrarios.
+En producción **no existe un token root** y **no se guarda ningún token en el
+`.env`**. Cada sesión de trabajo es:
 
-Se obtiene con Kubernetes auth, a partir de una ServiceAccount de un namespace
-autorizado para ese rol (pedile a un operador del vault cuál usar):
+1. sacar un token de vida corta del rol `ethsign-signer`;
+2. verificar que el vault custodia `DEPLOYER_ADDRESS`;
+3. desplegar / interactuar con el contrato;
+4. revocar el token.
+
+### Requisitos
+
+- `kubectl` con acceso al cluster donde corre OpenBao (`gcloud auth login` +
+  `gcloud container clusters get-credentials …`), `jq` y `curl`.
+- `npm install` y `npx hardhat compile` hechos.
+- El `.env` completo. Además de las variables de [arriba](#variables-de-entorno),
+  el login usa estas tres (los valores reales los da un operador del vault; no
+  van en este repo):
+
+| Var | Descripción |
+|-----|-------------|
+| `KUBE_CONTEXT` | Contexto de `kubectl` del cluster de producción |
+| `SIGNER_NAMESPACE` | Namespace autorizado para el rol `ethsign-signer` |
+| `SIGNER_SA` | ServiceAccount de ese namespace (default `default`) |
+
+### Token de OpenBao en producción
+
+El rol `ethsign-signer` sólo permite **leer cuentas y firmar transacciones**
+(`/sign`): no exporta claves, no firma digests arbitrarios y no administra el
+vault. El token dura **1h** y se puede renovar hasta **4h**.
 
 ```bash
-JWT=$(kubectl --context <cluster de prod> create token <service-account> -n <namespace> --duration=3600s)
+# 1. Cargar el .env en la shell (BAO_ADDR, KUBE_CONTEXT, SIGNER_NAMESPACE, …)
+set -a; source .env; set +a
+
+# 2. JWT de la ServiceAccount → token de OpenBao
+JWT=$(kubectl --context "$KUBE_CONTEXT" create token "${SIGNER_SA:-default}" \
+  -n "$SIGNER_NAMESPACE" --duration=3600s)
 export BAO_TOKEN=$(curl -s -d "{\"role\":\"ethsign-signer\",\"jwt\":\"$JWT\"}" \
   "$BAO_ADDR/v1/auth/kubernetes/login" | jq -r .auth.client_token)
+unset JWT
 
-npx hardhat check-deployer --network lnet   # ✅ Coinciden
-npm test
+# 3. Comprobar el token: políticas ["default","ethsign-signer"] y ttl ~3600
+curl -s -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/lookup-self" \
+  | jq '.data | {policies, ttl}'
 ```
 
-Exportalo en la shell en vez de escribirlo en el `.env`: `dotenv` no pisa una
-variable que ya existe en el entorno, así el token no queda en disco. Al terminar:
+Si el paso 2 deja `BAO_TOKEN=null`, el login falló: revisar `KUBE_CONTEXT`,
+`SIGNER_NAMESPACE` y que tu usuario pueda crear tokens en ese namespace.
+
+> El token se **exporta en la shell**, no se escribe en el `.env`. `dotenv` no
+> pisa una variable que ya existe en el entorno, así que Hardhat usa el token
+> exportado aunque el `.env` tenga `BAO_TOKEN=` vacío.
+
+### Verificar el deployer
 
 ```bash
-curl -s -X POST -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/revoke-self"
+npx hardhat check-deployer --network lnet
 ```
+```
+clave del bao    = 0x…
+DEPLOYER_ADDRESS = 0x…
+✅ Coinciden
+```
+
+Opcional: `npm test` firma una tx de prueba contra el vault (sin enviarla) y debe
+dar `2 passing`.
+
+### Desplegar
+
+```bash
+npx hardhat deploy-storage --value 42 --network lnet
+```
+```
+🔐 Clave del bao verificada → 0x…
+Desplegando Storage firmando con OpenBao...
+trustedForwarder: 0x…
+✅ Storage desplegado en: 0x<ADDRESS_DEL_CONTRATO>
+store(42) ok — retrieve(): 42
+```
+
+Anotar la address del contrato: es la que usan `store` y `retrieve`. Cada
+transacción vuelve a pedir la firma al vault con el mismo token.
+
+### Usar el contrato
+
+```bash
+npx hardhat store    --address 0x<ADDRESS_DEL_CONTRATO> --value 123 --network lnet   # firma
+npx hardhat retrieve --address 0x<ADDRESS_DEL_CONTRATO> --network lnet               # sólo lee
+```
+
+`retrieve` no necesita token: es una llamada `view` contra el RPC.
+
+Si la sesión dura más de una hora, renovar antes de que venza (hasta 4h en total):
+
+```bash
+curl -s -X POST -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/renew-self" \
+  | jq '.auth.lease_duration'
+```
+
+### Revocar el token al terminar
+
+```bash
+# 1. Revocar
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/revoke-self"     # → 204
+
+# 2. Confirmar que ya no sirve
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/lookup-self"     # → 403
+
+# 3. Sacarlo de la shell
+unset BAO_TOKEN
+```
+
+Aunque vence solo en 1h, revocarlo al terminar acorta la ventana en la que un
+token filtrado (historial, logs, otra terminal) sirve para firmar.
+
+### Errores comunes
+
+| Síntoma | Causa |
+|---------|-------|
+| `BAO_TOKEN=null` tras el login | Contexto o namespace equivocados, o sin permiso para `create token` |
+| `403 permission denied` al firmar | Token vencido o revocado: sacar uno nuevo |
+| `Signing account 0x… does not exist` | `DEPLOYER_ADDRESS` no es una cuenta de ese vault |
+| `❌ NO coinciden` en `check-deployer` | `DEPLOYER_ADDRESS` mal copiada |
+| El test dice `Falta BAO_TOKEN` | No se exportó el token en esta shell |
 
 ## Notas
 
