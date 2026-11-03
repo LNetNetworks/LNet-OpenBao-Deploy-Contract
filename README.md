@@ -34,7 +34,7 @@ npx hardhat compile
 | `NODE_ADDRESS` | Writer node que aprueba las tx (gas model) |
 | `DEPLOYER_ADDRESS` | Cuenta firmante; debe coincidir con la clave del bao |
 | `BAO_ADDR` | URL de OpenBao (default `http://127.0.0.1:8200`) |
-| `BAO_TOKEN` | Token de OpenBao |
+| `BAO_TOKEN` | Token de OpenBao. En local (docker, modo dev) es `root`; en producción, uno de vida corta con permiso de firma — ver [Token de OpenBao en producción](#token-de-openbao-en-producción) |
 | `BAO_MOUNT` | Path del plugin ethsign (default `ethereum`) |
 
 ## Tasks
@@ -121,7 +121,39 @@ El test verifica, firmando contra OpenBao real:
 3. `chainId == 0` y la `data` lleva el sufijo `nodeAddress + expiration` (gas model);
 4. la firma es `low-s` (EIP-2).
 
-Si el bao no está accesible, el test se salta (no falla) con un aviso.
+El test usa la misma cuenta que los tasks (`DEPLOYER_ADDRESS`). Sin ella, y sólo
+contra un bao local, cae a la Hardhat account #0 (`0xf39F…2266`), que es la que se
+importa en el bao de docker. La tx de prueba se firma con un nonce inalcanzable
+(`2^32-1`) y **nunca se envía**, así que la firma no sirve en la red aunque se filtre.
+
+Si el bao no está accesible, o falta `DEPLOYER_ADDRESS` / `BAO_TOKEN` contra un bao
+remoto, el test se salta (no falla) con un aviso.
+
+## Token de OpenBao en producción
+
+En producción **no existe un token root**, y no hay que guardar ningún token en el
+`.env`. Se usa uno de vida corta (1h, renovable hasta 4h) del rol `ethsign-signer`,
+que sólo permite leer cuentas y firmar transacciones (`/sign`): no exporta claves ni
+firma digests arbitrarios.
+
+Se obtiene con Kubernetes auth, a partir de una ServiceAccount de un namespace
+autorizado para ese rol (pedile a un operador del vault cuál usar):
+
+```bash
+JWT=$(kubectl --context <cluster de prod> create token <service-account> -n <namespace> --duration=3600s)
+export BAO_TOKEN=$(curl -s -d "{\"role\":\"ethsign-signer\",\"jwt\":\"$JWT\"}" \
+  "$BAO_ADDR/v1/auth/kubernetes/login" | jq -r .auth.client_token)
+
+npx hardhat check-deployer --network lnet   # ✅ Coinciden
+npm test
+```
+
+Exportalo en la shell en vez de escribirlo en el `.env`: `dotenv` no pisa una
+variable que ya existe en el entorno, así el token no queda en disco. Al terminar:
+
+```bash
+curl -s -X POST -H "X-Vault-Token: $BAO_TOKEN" "$BAO_ADDR/v1/auth/token/revoke-self"
+```
 
 ## Notas
 
